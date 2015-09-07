@@ -1,0 +1,6 @@
+= Spider
+
+Distributed web scraping/crawling platform including indexing
+for searching later
+
+
