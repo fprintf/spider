@@ -29,13 +29,31 @@ use LWP::UserAgent;
 #
 #
 
-my $ua = LWP::UserAgent->new();
 
-my @targets = [
+my @targets = (
     'http://nytimes.com/'
-];
+);
 
 my $job_queue = Thread::Queue->new();
+
+foreach my $job (@targets) {
+    add_job($job);
+}
+
+my @workers = make_workers(sub {
+        my ($url) = @_;
+        my $ua = LWP::UserAgent->new();
+        my @new_links = search_url($ua, $url);
+
+        foreach my $link (@new_links) {
+            add_job($link);
+        }
+    }
+);
+
+cleanup_workers(@workers);
+
+
 # Array of worker threadsb
 sub make_workers {
     my ($function, $count) = @_;
@@ -71,7 +89,7 @@ sub cleanup_workers {
     }
     # Close the queue for now so the workers know
     # to stop waiting for new jobs
-    $job_queue->end();
+    #$job_queue->end();
 
     while (my $worker = shift @workers) {
         # Join to thread and let it finish
@@ -79,18 +97,47 @@ sub cleanup_workers {
     }
 }
 
+# Add a url to the queue to be searched
 sub add_job {
     my ($job) = @_;
     $job_queue->enqueue($job);
 }
 
+sub fixup_link {
+    my ($link, $baseurl) = @_;
+    if ($link =~ /^(?:(https?):\/\/|www\.)(.*)$/) {
+        my $proto = $1 || 'http';
+        $link = sprintf("%s://%s", $proto, $2);
+    } else {
+        $link =~ s/\/*$//g;
+        $link = sprintf("%s/%s", $baseurl, $link);
+    }
+    return $link;
+}
 
-# Get url and return all the links as an arrayref on the page 
+# Find all the links in content and return an array of them
+sub get_links {
+    my ($content, $baseurl) = @_;
+    my @links;
+
+    while ($content =~ /[hH][rR][Ee][Ff]\s*=\s*['"]?\s*([^'"\s]+)\s*['"]?/gms) {
+        my $link = fixup_link($1, $baseurl);
+        print STDERR "found link: [$link]\n";
+        push(@links, $link);
+    }
+
+    return @links;
+}
+
+
+# Get url and return all the links as an array on the page 
 # TODO also index the content of the page for fulltext search
 sub search_url {
     my ($ua, $url) = @_;
     my @links;
 
+    sleep 3;
+    print STDERR "fetching url: $url\n";
     my $r = $ua->get($url);
     if (!$r->is_success()) {
         print STDERR "failed to fetch: $url: ".$r->status_line()."\n";
@@ -99,7 +146,9 @@ sub search_url {
 
     # TODO index content for fulltext search and index by url
     #
-    #
+
+    # Parse out all the links in the page
+    @links = get_links($r->decoded_content(), $url);
     
     return @links;
 }
