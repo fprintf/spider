@@ -5,7 +5,7 @@ use strict;
 use warnings;
 
 use threads;
-use Thread::Queue;
+use threads::shared;
 use LWP::UserAgent;
 
 # 1. Remove the first website from the queue (FIFO i think makes sense here)
@@ -29,15 +29,63 @@ use LWP::UserAgent;
 #
 #
 
+{
+    package Spider::Queue;
+    my $expire_time = 300; # Time before we re-check a url
+    sub new {
+        my $class = shift;
+        my $self = bless {}, $class;
+        my @jobqueue :shared;
+        my %db :shared;
+        $self->{queue} = \@jobqueue;
+        $self->{db} = \%db;
+        return $self;
+    }
+
+    # Add an item to the job queue
+    sub add {
+        my ($self, @jobs) = @_;
+        my @filtered = grep { 
+            if (!exists($self->{db}{$_}) || $self->{db}{$_}{expires} > time) {
+                lock($self->{db});
+                my %hash :shared = (expires => time + $expire_time);
+                $self->{db}{$_} = \%hash;
+                return 1;
+            }
+            return 0;
+        } @jobs;
+        lock($self->{queue});
+        push(@{$self->{queue}}, @filtered);
+    }
+
+    # Get an item from the queue
+    sub shift {
+        my ($self) = @_;
+
+        lock($self->{queue});
+        my $item = shift @{$self->{queue}};
+        return $item;
+    }
+
+    # Return true if the queue is empty
+    sub empty {
+        my ($self) = @_;
+        return !@{$self->{queue}};
+    }
+
+    1;
+}
+
 
 my @targets = (
     'http://nytimes.com/'
 );
 
-my $job_queue = Thread::Queue->new();
+my $job_queue = Spider::Queue->new;
+
 
 foreach my $job (@targets) {
-    add_job($job);
+    $job_queue->add($job);
 }
 
 my @workers = make_workers(sub {
@@ -46,7 +94,7 @@ my @workers = make_workers(sub {
         my @new_links = search_url($ua, $url);
 
         foreach my $link (@new_links) {
-            add_job($link);
+            $job_queue->add($link);
         }
     }
 );
@@ -65,7 +113,18 @@ sub make_workers {
     for (my $i = 0; $i < $count; ++$i) {
         my $thread = threads->create(
             sub { 
-                while (my $job = $job_queue->dequeue()) {
+                my $count = 10;
+                while (1) {
+                    if ($job_queue->empty()) {
+                        sleep(1);
+                        # Only try $count times again before exiting
+                        if (--$count == 0) {
+                            last;
+                        }
+                        next;
+                    }
+
+                    my $job = $job_queue->shift();
                     $function->($job);
                 }
             }
@@ -80,27 +139,10 @@ sub make_workers {
 sub cleanup_workers {
     my (@workers) = @_;
 
-    # Jobs left in queue represent work that won't get done until
-    # we start making this distributed which those will go into the global queue
-    # then
-    my $remaining = $job_queue->pending();
-    if ($remaining > 0) {
-        print STDERR "warning: $remaining items left uncomplete in job queue!\n";
-    }
-    # Close the queue for now so the workers know
-    # to stop waiting for new jobs
-    #$job_queue->end();
-
     while (my $worker = shift @workers) {
         # Join to thread and let it finish
         $worker->join();
     }
-}
-
-# Add a url to the queue to be searched
-sub add_job {
-    my ($job) = @_;
-    $job_queue->enqueue($job);
 }
 
 sub fixup_link {
@@ -119,9 +161,15 @@ sub fixup_link {
 sub get_links {
     my ($content, $baseurl) = @_;
     my @links;
+    my $exempt_re = qr/\.(?:png|jpe?g|gif|mov|mp4|avi|vgif|webm)$/;
+
 
     while ($content =~ /[hH][rR][Ee][Ff]\s*=\s*['"]?\s*([^'"\s]+)\s*['"]?/gms) {
         my $link = fixup_link($1, $baseurl);
+        if ($link =~ /$exempt_re/i) { 
+            print STDERR "exempted: [$link]\n";
+            next;
+        }
         print STDERR "found link: [$link]\n";
         push(@links, $link);
     }
@@ -136,7 +184,7 @@ sub search_url {
     my ($ua, $url) = @_;
     my @links;
 
-    sleep 3;
+    sleep 5 * rand(10);
     print STDERR "fetching url: $url\n";
     my $r = $ua->get($url);
     if (!$r->is_success()) {
